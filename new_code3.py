@@ -14,6 +14,7 @@ import ibm_boto3
 from ibm_botocore.client import Config
 import logging
 import re
+import threading
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +44,9 @@ MILVUS_GRPC_HOST = os.getenv("MILVUS_GRPC_HOST", "4c5f2692-40e6-4b8b-8cb9-84cc5a
 MILVUS_GRPC_PORT = os.getenv("MILVUS_GRPC_PORT", "30319")
 MILVUS_URI = f"grpc://{MILVUS_GRPC_HOST}:{MILVUS_GRPC_PORT}"
 
+milvus_connected = False
+collection = None
+
 try:
     connections.connect(
         alias="default",
@@ -51,40 +55,47 @@ try:
         password=MILVUS_PASSWORD,
         secure=True
     )
+    milvus_connected = True
     logging.info("✅ Connected to Milvus")
 except Exception as e:
     logging.error(f"❌ Milvus connection failed: {e}")
+    milvus_connected = False
+
+if milvus_connected:
+    collection_name = "sop_collection"
+    try:
+        if utility.has_collection(collection_name):
+            collection = Collection(name=collection_name)
+            collection.load()
+            logging.info(f"✅ Loaded collection with {collection.num_entities} entities")
+        else:
+            fields = [
+                FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+                FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=384),
+                FieldSchema(name="sop_text", dtype=DataType.VARCHAR, max_length=10000),
+                FieldSchema(name="source_file", dtype=DataType.VARCHAR, max_length=500),
+                FieldSchema(name="sop_no", dtype=DataType.VARCHAR, max_length=500),
+                FieldSchema(name="task", dtype=DataType.VARCHAR, max_length=500),
+                FieldSchema(name="approvals", dtype=DataType.VARCHAR, max_length=1000),
+                FieldSchema(name="responsibility", dtype=DataType.VARCHAR, max_length=500),
+                FieldSchema(name="timelines", dtype=DataType.VARCHAR, max_length=500),
+                FieldSchema(name="remarks", dtype=DataType.VARCHAR, max_length=1000),
+            ]
+            schema = CollectionSchema(fields, description="SOP chatbot embeddings")
+            collection = Collection(name=collection_name, schema=schema)
+            collection.create_index(
+                field_name="embedding",
+                index_params={"index_type": "IVF_FLAT", "metric_type": "COSINE", "params": {"nlist": 128}}
+            )
+            collection.load()
+            logging.info("✅ Created new Milvus collection")
+    except Exception as e:
+        logging.error(f"❌ Milvus collection error: {e}")
+        collection = None
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
-collection_name = "sop_collection"
-
-if utility.has_collection(collection_name):
-    collection = Collection(name=collection_name)
-    collection.load()
-    logging.info(f"✅ Loaded collection with {collection.num_entities} entities")
-else:
-    fields = [
-        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=384),
-        FieldSchema(name="sop_text", dtype=DataType.VARCHAR, max_length=10000),
-        FieldSchema(name="source_file", dtype=DataType.VARCHAR, max_length=500),
-        FieldSchema(name="sop_no", dtype=DataType.VARCHAR, max_length=500),
-        FieldSchema(name="task", dtype=DataType.VARCHAR, max_length=500),
-        FieldSchema(name="approvals", dtype=DataType.VARCHAR, max_length=1000),
-        FieldSchema(name="responsibility", dtype=DataType.VARCHAR, max_length=500),
-        FieldSchema(name="timelines", dtype=DataType.VARCHAR, max_length=500),
-        FieldSchema(name="remarks", dtype=DataType.VARCHAR, max_length=1000),
-    ]
-    schema = CollectionSchema(fields, description="SOP chatbot embeddings")
-    collection = Collection(name=collection_name, schema=schema)
-    collection.create_index(
-        field_name="embedding",
-        index_params={"index_type": "IVF_FLAT", "metric_type": "COSINE", "params": {"nlist": 128}}
-    )
-    collection.load()
-    logging.info("✅ Created new Milvus collection")
-
 full_df = None
+data_loading = False
 
 class QueryRequest(BaseModel):
     query: str
@@ -100,16 +111,31 @@ class SOPResponse(BaseModel):
     summary: str
     match_type: str
 
+def load_sop_data_background():
+    """Load SOP data in background thread to not block startup"""
+    global full_df, data_loading
+    try:
+        data_loading = True
+        logging.info("Loading SOP data in background...")
+        full_df = load_sop_data_from_cos()
+        if full_df is not None and not full_df.empty and collection is not None:
+            store_embeddings_to_milvus(full_df)
+            logging.info(f"✅ Loaded {len(full_df)} SOP records")
+        else:
+            logging.warning("⚠️ No SOP data loaded or Milvus not available")
+    except Exception as e:
+        logging.error(f"❌ Error loading SOP data: {e}")
+    finally:
+        data_loading = False
+
 @app.on_event("startup")
 async def startup_event():
-    global full_df
-    logging.info("Loading SOP data on startup...")
-    full_df = load_sop_data_from_cos()
-    if full_df is not None and not full_df.empty:
-        store_embeddings_to_milvus(full_df)
-        logging.info(f"✅ Loaded {len(full_df)} SOP records")
-    else:
-        logging.warning("⚠️ No SOP data loaded")
+    """Start background data loading without blocking app startup"""
+    logging.info("SOP Chatbot API starting...")
+    # Load data in background thread
+    thread = threading.Thread(target=load_sop_data_background, daemon=True)
+    thread.start()
+    logging.info("✅ App started (data loading in background)")
 
 def list_cos_files():
     try:
@@ -244,6 +270,10 @@ def load_sop_data_from_cos():
     return pd.concat(all_data, ignore_index=True)
 
 def store_embeddings_to_milvus(df):
+    if collection is None:
+        logging.warning("Milvus collection not available")
+        return
+    
     if collection.num_entities > 0:
         logging.info(f"Milvus already has {collection.num_entities} embeddings. Skipping.")
         return
@@ -306,7 +336,7 @@ def search_sop(query_text, top_k=3, threshold=0.35):
             "type": "partial"
         }
 
-    if collection.num_entities == 0:
+    if collection is None or collection.num_entities == 0:
         return None
     
     try:
@@ -352,13 +382,14 @@ async def root():
 
 @app.get("/health")
 async def health():
-    milvus_status = collection.num_entities > 0
+    milvus_status = collection is not None and collection.num_entities > 0
     data_loaded = full_df is not None and not full_df.empty
     return {
         "status": "healthy",
         "milvus": milvus_status,
         "data_loaded": data_loaded,
-        "embeddings": collection.num_entities if milvus_status else 0,
+        "data_loading": data_loading,
+        "embeddings": collection.num_entities if collection is not None else 0,
         "records": len(full_df) if data_loaded else 0
     }
 
@@ -366,6 +397,12 @@ async def health():
 async def query_sop(request: QueryRequest):
     if not request.query or len(request.query.strip()) == 0:
         raise HTTPException(status_code=400, detail="Query cannot be empty")
+    
+    if data_loading:
+        raise HTTPException(status_code=503, detail="Data is still loading. Please try again in a moment.")
+    
+    if full_df is None or full_df.empty:
+        raise HTTPException(status_code=503, detail="SOP data not loaded yet")
     
     result = search_sop(request.query)
     
@@ -398,9 +435,10 @@ async def query_sop(request: QueryRequest):
 @app.get("/status")
 async def status():
     return {
-        "milvus_entities": collection.num_entities,
+        "milvus_entities": collection.num_entities if collection is not None else 0,
         "sop_records": len(full_df) if full_df is not None else 0,
-        "cos_files": len(list_cos_files())
+        "cos_files": len(list_cos_files()),
+        "data_loading": data_loading
     }
 
 if __name__ == "__main__":
